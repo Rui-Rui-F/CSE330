@@ -8,6 +8,8 @@
 #include <linux/semaphore.h>
 #include <linux/spinlock.h>
 #include <linux/slab.h>
+#include <linux/rcupdate.h>
+#include <linux/cred.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Your Name");
@@ -65,10 +67,12 @@ static int producer_fn(void *data)
             if (kthread_should_stop())
                 break;
 
-            if (from_kuid_munged(current_user_ns(), t->cred->uid) != (uid_t)uid)
+            /* Filter by UID using RCU-safe helper */
+            if (from_kuid_munged(current_user_ns(), task_uid(t)) != (uid_t)uid)
                 continue;
 
-            if (t->exit_state & EXIT_ZOMBIE) {
+            /* Check zombie state safely */
+            if (READ_ONCE(t->exit_state) & EXIT_ZOMBIE) {
                 int ret = down_interruptible(&sem_empty);
                 if (ret) {
                     if (kthread_should_stop()) {
@@ -78,14 +82,20 @@ static int producer_fn(void *data)
                     continue;
                 }
 
+                /* keep task alive across queueing */
                 get_task_struct(t);
 
                 spin_lock(&r_lock);
                 ring_push(t);
                 spin_unlock(&r_lock);
 
-                printk(KERN_INFO "[Producer-%d] has produced a zombie process with pid %d and parent pid %d\n",
-                       id, t->pid, t->parent ? t->parent->pid : 0);
+                /* Parent under RCU */
+                {
+                    struct task_struct *pp = rcu_dereference(t->real_parent);
+                    int ppid = pp ? pp->pid : 0;
+                    printk(KERN_INFO "[Producer-%d] has produced a zombie process with pid %d and parent pid %d\n",
+                           id, t->pid, ppid);
+                }
 
                 up(&sem_full);
                 cond_resched();
@@ -126,8 +136,17 @@ static int consumer_fn(void *data)
         up(&sem_empty);
 
         if (z) {
+            int ppid = 0;
+            rcu_read_lock();
+            if (rcu_access_pointer(z->real_parent)) {
+                struct task_struct *pp = rcu_dereference(z->real_parent);
+                ppid = pp ? pp->pid : 0;
+            }
+            rcu_read_unlock();
+
             printk(KERN_INFO "[Consumer-%d] has consumed a zombie process with pid %d and parent pid %d\n",
-                   id, z->pid, z->parent ? z->parent->pid : 0);
+                   id, z->pid, ppid);
+
             put_task_struct(z);
         }
 
@@ -140,30 +159,18 @@ static int __init producer_consumer_init(void)
 {
     int i;
 
-    if (size <= 0) {
-        pr_err("size must be > 0\n");
-        return -EINVAL;
-    }
-    if (prod < 0 || prod > 1) {
-        pr_err("prod must be 0 or 1\n");
-        return -EINVAL;
-    }
-    if (cons < 0) {
-        pr_err("cons must be >= 0\n");
-        return -EINVAL;
-    }
+    if (size <= 0) return -EINVAL;
+    if (prod < 0 || prod > 1) return -EINVAL;
+    if (cons < 0) return -EINVAL;
 
     ring = kcalloc(size, sizeof(*ring), GFP_KERNEL);
-    if (!ring)
-        return -ENOMEM;
+    if (!ring) return -ENOMEM;
 
     prod_ts = (prod > 0) ? kcalloc(prod, sizeof(*prod_ts), GFP_KERNEL) : NULL;
-    if (prod > 0 && !prod_ts)
-        goto err_ring;
+    if (prod > 0 && !prod_ts) goto err_ring;
 
     cons_ts = (cons > 0) ? kcalloc(cons, sizeof(*cons_ts), GFP_KERNEL) : NULL;
-    if (cons > 0 && !cons_ts)
-        goto err_prod;
+    if (cons > 0 && !cons_ts) goto err_prod;
 
     sema_init(&sem_empty, size);
     sema_init(&sem_full, 0);
@@ -174,12 +181,7 @@ static int __init producer_consumer_init(void)
             if (!arg) goto err_threads;
             arg->id = i + 1;
             prod_ts[i] = kthread_run(producer_fn, arg, "Producer-%d", arg->id);
-            if (IS_ERR(prod_ts[i])) {
-                pr_err("Failed to start producer %d\n", i + 1);
-                kfree(arg);
-                prod_ts[i] = NULL;
-                goto err_threads;
-            }
+            if (IS_ERR(prod_ts[i])) { kfree(arg); prod_ts[i] = NULL; goto err_threads; }
         }
     }
 
@@ -188,12 +190,7 @@ static int __init producer_consumer_init(void)
         if (!arg) goto err_threads;
         arg->id = i + 1;
         cons_ts[i] = kthread_run(consumer_fn, arg, "Consumer-%d", arg->id);
-        if (IS_ERR(cons_ts[i])) {
-            pr_err("Failed to start consumer %d\n", i + 1);
-            kfree(arg);
-            cons_ts[i] = NULL;
-            goto err_threads;
-        }
+        if (IS_ERR(cons_ts[i])) { kfree(arg); cons_ts[i] = NULL; goto err_threads; }
     }
 
     pr_info("producer_consumer loaded (prod=%d, cons=%d, size=%d, uid=%d)\n",
@@ -201,22 +198,8 @@ static int __init producer_consumer_init(void)
     return 0;
 
 err_threads:
-    if (prod_ts) {
-        for (i = 0; i < prod; i++) {
-            if (prod_ts[i]) {
-                kthread_stop(prod_ts[i]);
-                prod_ts[i] = NULL;
-            }
-        }
-    }
-    if (cons_ts) {
-        for (i = 0; i < cons; i++) {
-            if (cons_ts[i]) {
-                kthread_stop(cons_ts[i]);
-                cons_ts[i] = NULL;
-            }
-        }
-    }
+    if (prod_ts) for (i = 0; i < prod; i++) if (prod_ts[i]) { kthread_stop(prod_ts[i]); prod_ts[i] = NULL; }
+    if (cons_ts) for (i = 0; i < cons; i++) if (cons_ts[i]) { kthread_stop(cons_ts[i]); cons_ts[i] = NULL; }
     kfree(cons_ts);
 err_prod:
     kfree(prod_ts);
@@ -229,23 +212,8 @@ static void __exit producer_consumer_exit(void)
 {
     int i;
 
-    if (prod_ts) {
-        for (i = 0; i < prod; i++) {
-            if (prod_ts[i]) {
-                kthread_stop(prod_ts[i]);
-                prod_ts[i] = NULL;
-            }
-        }
-    }
-
-    if (cons_ts) {
-        for (i = 0; i < cons; i++) {
-            if (cons_ts[i]) {
-                kthread_stop(cons_ts[i]);
-                cons_ts[i] = NULL;
-            }
-        }
-    }
+    if (prod_ts) for (i = 0; i < prod; i++) if (prod_ts[i]) { kthread_stop(prod_ts[i]); prod_ts[i] = NULL; }
+    if (cons_ts) for (i = 0; i < cons; i++) if (cons_ts[i]) { kthread_stop(cons_ts[i]); cons_ts[i] = NULL; }
 
     spin_lock(&r_lock);
     while (r_cnt > 0) {
